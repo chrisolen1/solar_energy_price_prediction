@@ -1,0 +1,663 @@
+---
+title: "Time Series Analysis Final Project"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, echo=TRUE,results='hide',fig.keep='all',message=FALSE}
+library(fpp)
+library(tseries)
+library(TSA)
+library(ggplot2)
+library(forecast)
+library(expsmooth)
+library(readxl)
+library(xts)
+library(plotrix)
+```
+
+Reading in data:
+```{r}
+datapath <- "/Users/chrisolen/Documents/uchicago_courses/time_series/project"
+solar <- ts(read.csv(paste(datapath, "solar.csv",sep = '/')), start=c(1989,1), end=c(2019,4), frequency=12)
+solar_production <- solar[,2]
+solar_production_train <- ts(solar_production[1:348],start=c(1989,1), frequency=12)
+solar_production_test <- ts(solar_production[349:360], end=c(2018,12), frequency=12)
+head(solar)
+```
+
+Plotting the series:
+```{r}
+plot(solar_production)
+plot(decompose(solar_production, type = c("multiplicative")))
+```
+
+BoxCox.lambda recommends a lambda of -0.02 (roughly a log transformation):
+```{r}
+lambda <- BoxCox.lambda(solar_production_train)
+lambda
+plot(BoxCox(solar_production, lambda = lambda))
+```
+
+# Baseline Model:
+
+$Y_t=Y_{t-1}+e_t$
+
+```{r}
+baseline <- Arima(solar_production_train, order = c(0,1,0), lambda = "auto")
+summary(baseline)
+checkresiduals(baseline)
+```
+
+# Performing CV and calculating MAE, MSE, and AICc for baseline model:
+
+```{r}
+k <- 180 # Minimum data length for fitting a model
+n <- length(solar_production_train) # Number of data points
+p <- 12 # Period
+H <- 12 # Forecast Horizon
+
+st <- tsp(solar_production_train)[1]+(k-2)/p # start time in units
+print(st)
+model_error <- matrix(NA,n-k,H)
+AICc_model <- list()
+
+### One Month rolling forecasting ###
+  
+# Sliding Window - With window of length = 180
+
+for(i in 1:(n-k))
+{
+
+  train_sli <- window(solar_production_train, start=st+(i-k+1)/p, end=st+i/p) ## Window Length: k
+  val <- window(solar_production_train, start=st + (i+1)/p, end=st + (i+H)/p) ## Window Length: H
+  if (i<4) {
+  cat(c("*** CV", i,":","len(Sliding Window):",length(train_sli), "len(Val):",length(val),'\n'  ))
+  cat(c("*** TRAIN - Sliding WIndow:",tsp(train_sli)[1],'-',tsp(train_sli)[2],'\n'))
+  cat(c("*** TEST:",tsp(val)[1],'-',tsp(val)[2],'\n'))
+  cat("*************************** \n \n")
+  }
+  
+  fit_model <- Arima(train_sli, order=c(0,1,0), seasonal=list(order=c(0,0,0), period=p),
+                include.drift=TRUE, lambda='auto', method="ML")
+  
+  fcast_model <- forecast(fit_model, h=H)
+  
+  model_error[i,1:length(val)] <- fcast_model[['mean']]-val
+  
+  AICc_model <- append(AICc_model, fit_model$aicc)
+}
+```
+```{r}
+MAE <- function(x){
+  return(mean(abs(x),na.rm=TRUE))
+}
+
+MSE <- function(x){
+  return(mean(x^2, na.rm=TRUE))
+}
+
+flattenlist <- function(x){  
+  morelists <- sapply(x, function(xprime) class(xprime)[1]=="list")
+  out <- c(x[!morelists], unlist(x[morelists], recursive=FALSE))
+  if(sum(morelists)){ 
+    Recall(out)
+  }else{
+    return(out)
+  }
+}
+
+MAE_model <- apply(model_error, 1, MAE)
+MSE_model <- apply(model_error, 1, MSE)
+
+baseline.MAE <- mean(MAE_model)
+baseline.MSE <- mean(MSE_model)
+results <- rbind(baseline.MAE, baseline.MSE)
+rownames(results) <- c("MAE","MSE")
+colnames(results) <- c("Baseline")
+cat("Mean AICc:", mean(unlist(flattenlist(AICc_model))))
+
+```
+```{r}
+results
+
+```
+
+# Forecasting Error for Baseline Model:
+
+```{r}
+baseline.forecast.MSE <- mean((forecast(baseline, h = 12)$mean - solar_production_test)^2)
+baseline.forecast.MSE
+baseline.forecast.MAE <- mean(abs(forecast(baseline, h = 12)$mean - solar_production_test))
+baseline.forecast.MAE
+plot(forecast(baseline, h = 12))
+
+```
+
+# ARIMA Models:
+
+Plotting ACF and PACF:
+```{r}
+solar_production_train.transformed <- BoxCox(solar_production_train, lambda = lambda) 
+acf1 <- acf(as.vector(solar_production_train.transformed), lag = 24)
+plot(acf1, main = "ACF - No Differencing")
+pacf1 <- pacf(as.vector(solar_production_train.transformed), lag = 24)
+plot(pacf1, main = "PACF - No Differencing")
+```
+
+
+Significant autocorrelation at lags 1 and 4. Seasonal pattern seen in the decay. ACF function indicates non-stationarity. 
+
+Employ Augmented Dickey-Fuller to confirm:
+```{r}
+adf.test(solar_production_train.transformed, alternative='stationary')
+```
+
+Definitely not stationary!
+
+Plotting the unit circle for the baseline model:
+```{r}
+nodifferencing <- auto.arima(solar_production_train.transformed)
+p1 <- c(1,-nodifferencing$ar) # coefficients of the characteristic polynomial
+r1 <- polyroot(p1) # and solving for the roots
+r1Re <- Re(r1) # finding real parts of the roots
+r1Im <- Im(r1) # finding imaginary parts of the roots
+plot(r1Re,r1Im,asp=1,xlim=c(min(r1Re),max(r1Re)),ylim=c(min(r1Im),max(r1Im)))
+draw.circle(0,0,radius=1)
+abline(v=0)
+abline(h=0)
+
+```
+
+One of the roots is way outside of the unit circle. 
+
+Let's apply first order differencing and re-examine the ACF and PACF:
+```{r}
+acf2 <- acf(as.vector(diff(solar_production_train.transformed)), lag = 24)
+
+pacf2 <- pacf(as.vector(diff(solar_production_train.transformed)), lag = 24)
+```
+
+There's still a pretty clear seasonal pattern, particularly in the ACF. 
+
+Let's apply seasonal differencing and re-examine the ACF and PACF:
+```{r}
+acf3 <- acf(as.vector(diff(diff(solar_production_train.transformed), lag = 12)), lag = 24)
+pacf3 <- pacf(as.vector(diff(diff(solar_production_train.transformed), lag = 12)), lag = 24)
+```
+
+
+ACF and PACF yield significant values at lag = 1 and after one seasonal period. Let's apply an ARIMA(1,1,1)(1,1,1)12:
+```{r}
+arima.model.1 <- Arima(solar_production_train, order=c(1,1,1), seasonal=list(order=c(1,1,1), period=12), lambda='auto')
+summary(arima.model.1)
+checkresiduals(arima.model.1)
+```
+
+Let's apply an ARIMA(1,1,1)(0,1,1)12:
+```{r}
+arima.model.2 <- Arima(solar_production_train, order=c(1,1,1), seasonal=list(order=c(0,1,1), period=12), lambda='auto')
+summary(arima.model.2)
+checkresiduals(arima.model.2)
+```
+
+All point estimates are now significant, but we still reject the null hypothesis that there is no serial autocorrelation in the residuals, per Box-Ljung. 
+
+Let's use EACF to see if we can get a more granular look at AR/MA orders:
+```{r}
+eacf.model <- eacf(diff(diff(log(solar_production_train), lag = 12)), 12, 12)
+
+compare.with <- 2/sqrt(length(diff(diff(log(solar_production_train), lag = 12))))
+print(abs(eacf.model$eacf)-compare.with,digits=2)
+
+```
+
+ARIMA(0,1,1)(0,1,1)12 seems like another candidate:
+
+
+```{r}
+arima.model.3 <- Arima(solar_production_train, order=c(0,1,1), seasonal=list(order=c(0,1,1), period=12), lambda='auto', method="ML")
+summary(arima.model.3)
+checkresiduals(arima.model.3)
+```
+
+All point estimates are still significant and now we do not reject the null hypothesis of the Box-Ljung test at a confidence level of .01.  
+
+One last attempt per EACF: ARIMA(2,1,1)(0,1,1)12:
+```{r}
+arima.model.4 <- Arima(solar_production, order=c(2,1,1), seasonal=list(order=c(0,1,1), period=12), lambda='auto', method="ML")
+summary(arima.model.4)
+checkresiduals(arima.model.4)
+```
+
+The second order autoregression point estimate is insignificant, the Box-Ljung p-value has dropped below .01, and AICc has increased. 
+
+One last ARIMA exploration before we check Auto.Arima: Let's hone in on the fact that PACF was significant at lag 4 by nullifying all of the order coefficients prior:
+```{r}
+arima.model.5 <- Arima(solar_production_train, order=c(4,1,1), seasonal=list(order=c(0,1,1), period=12), method="ML", fixed = c(NA,0,0,NA,NA,NA), lambda = 'auto')
+arima.model.5
+checkresiduals(arima.model.5)
+```
+
+The point estimate for order 4 moving average is insignificant, and we don't see much improvement with respect to the Box-Ljung test or AICc. 
+
+Let's employ Auto.Arima:
+```{r}
+auto.arima.model <- auto.arima(solar_production_train, lambda = 'auto')
+summary(auto.arima.model)
+checkresiduals(auto.arima.model)
+```
+
+We get an ARIMA(0,1,2)(0,1,1)12 from Auto.Arima. 
+
+Let's apply cross-validation on ARIMA(0,1,2)(0,1,1)12 and ARIMA(0,1,1)(0,1,1)12.
+
+# Performing CV and calculating MAE, MSE, and AICc for ARIMA(0,1,1)(0,1,1)12:
+
+$y_t=(1+-0.2384e_{t-1})(1+-0.6214e_{t-12})$
+
+```{r}
+k <- 180 # Minimum data length for fitting a model
+n <- length(solar_production_train) # Number of data points
+p <- 12 # Period
+H <- 12 # Forecast Horizon
+
+st <- tsp(solar_production_train)[1]+(k-2)/p # start time in units
+print(st)
+model_error <- matrix(NA,n-k,H)
+AICc_model <- list()
+
+### One Month rolling forecasting ###
+  
+# Sliding Window - With window of length = 180
+
+for(i in 1:(n-k))
+{
+
+  train_sli <- window(solar_production_train, start=st+(i-k+1)/p, end=st+i/p) ## Window Length: k
+  val <- window(solar_production_train, start=st + (i+1)/p, end=st + (i+H)/p) ## Window Length: H
+  if (i<4) {
+  cat(c("*** CV", i,":","len(Sliding Window):",length(train_sli), "len(Val):",length(val),'\n'  ))
+  cat(c("*** TRAIN - Sliding WIndow:",tsp(train_sli)[1],'-',tsp(train_sli)[2],'\n'))
+  cat(c("*** TEST:",tsp(val)[1],'-',tsp(val)[2],'\n'))
+  cat("*************************** \n \n")
+  }
+  
+  fit_model <- Arima(train_sli, order=c(0,1,1), seasonal=list(order=c(0,1,1), period=12), lambda='auto', method="ML")
+  
+  fcast_model <- forecast(fit_model, h=H)
+  
+  model_error[i,1:length(val)] <- fcast_model[['mean']]-val
+  
+  AICc_model <- append(AICc_model, fit_model$aicc)
+}
+```
+
+```{r}
+MAE <- function(x){
+  return(mean(abs(x),na.rm=TRUE))
+}
+
+MSE <- function(x){
+  return(mean(x^2, na.rm=TRUE))
+}
+
+flattenlist <- function(x){  
+  morelists <- sapply(x, function(xprime) class(xprime)[1]=="list")
+  out <- c(x[!morelists], unlist(x[morelists], recursive=FALSE))
+  if(sum(morelists)){ 
+    Recall(out)
+  }else{
+    return(out)
+  }
+}
+
+MAE_model <- apply(model_error, 1, MAE)
+MSE_model <- apply(model_error, 1, MSE)
+
+arima011.MAE <- mean(MAE_model)
+arima011.MSE <- mean(MSE_model)
+results <- cbind(results,rbind(arima011.MAE, arima011.MSE))
+colnames(results) <- c("Baseline","ARIMA(0,1,1)(0,1,1)12")
+
+cat("Mean AICc:", mean(unlist(flattenlist(AICc_model))))
+```
+```{r}
+results
+
+```
+
+# Performing CV and calculating MAE, MSE, and AICc for ARIMA(0,1,2)(0,1,1)12:
+
+$y_t=(1+-0.2262e_{t-1}+-0.1053e_{t-2})(1+-0.6104e_{t-12})$
+
+```{r}
+k <- 180 # Minimum data length for fitting a model
+n <- length(solar_production_train) # Number of data points
+p <- 12 # Period
+H <- 12 # Forecast Horizon
+
+st <- tsp(solar_production_train)[1]+(k-2)/p # start time in units
+print(st)
+model_error <- matrix(NA,n-k,H)
+AICc_model <- list()
+
+### One Month rolling forecasting ###
+  
+# Sliding Window - With window of length = 180
+
+for(i in 1:(n-k))
+{
+
+  train_sli <- window(solar_production_train, start=st+(i-k+1)/p, end=st+i/p) ## Window Length: k
+  val <- window(solar_production_train, start=st + (i+1)/p, end=st + (i+H)/p) ## Window Length: H
+  if (i<4) {
+  cat(c("*** CV", i,":","len(Sliding Window):",length(train_sli), "len(Val):",length(val),'\n'  ))
+  cat(c("*** TRAIN - Sliding WIndow:",tsp(train_sli)[1],'-',tsp(train_sli)[2],'\n'))
+  cat(c("*** TEST:",tsp(val)[1],'-',tsp(val)[2],'\n'))
+  cat("*************************** \n \n")
+  }
+  
+  fit_model <- Arima(train_sli, order=c(0,1,2), seasonal=list(order=c(0,1,1), period=p), method="ML", lambda = 'auto')
+  
+  fcast_model <- forecast(fit_model, h=H)
+  
+  model_error[i,1:length(val)] <- fcast_model[['mean']]-val
+  
+  AICc_model <- append(AICc_model, fit_model$aicc)
+}
+```
+```{r}
+MAE <- function(x){
+  return(mean(abs(x),na.rm=TRUE))
+}
+
+MSE <- function(x){
+  return(mean(x^2, na.rm=TRUE))
+}
+
+flattenlist <- function(x){  
+  morelists <- sapply(x, function(xprime) class(xprime)[1]=="list")
+  out <- c(x[!morelists], unlist(x[morelists], recursive=FALSE))
+  if(sum(morelists)){ 
+    Recall(out)
+  }else{
+    return(out)
+  }
+}
+
+MAE_model <- apply(model_error, 1, MAE)
+MSE_model <- apply(model_error, 1, MSE)
+
+arima012.MAE <- mean(MAE_model)
+arima012.MSE <- mean(MSE_model)
+results <- cbind(results,rbind(arima012.MAE, arima012.MSE))
+colnames(results) <- c("Baseline","ARIMA(0,1,1)(0,1,1)12", "ARIMA(0,1,2)(0,1,1)12")
+
+cat("Mean AICc:", mean(unlist(flattenlist(AICc_model))))
+```
+```{r}
+results
+
+```
+
+# Forecasting Error for Arima Model:
+
+```{r}
+arima011.forecast.MSE <- mean((forecast(arima.model.3, h = 12)$mean - solar_production_test)^2)
+arima011.forecast.MSE
+arima011.forecast.MAE <- mean(abs(forecast(arima.model.3, h = 12)$mean - solar_production_test))
+arima011.forecast.MAE
+plot(forecast(arima.model.3, h = 12))
+```
+\
+# Forecasting Error for Auto Arima:
+
+```{r}
+arima012.forecast.MSE <- mean((forecast(auto.arima.model, h = 12)$mean - solar_production_test)^2)
+arima012.forecast.MSE
+arima012.forecast.MAE <- mean(abs(forecast(auto.arima.model, h = 12)$mean - solar_production_test))
+arima012.forecast.MAE
+plot(forecast(auto.arima.model, h = 12))
+
+```
+
+# ETS:
+$y_t=(l_{t-1}+0.85 b_{t-1}+s_{t-m})(1+\epsilon _t)$
+$l_t=(l_{t-1}+0.85 b_{t-1}+0.612(l_{t-1}+0.85 b_{t-1}+s_{t-m})(\epsilon _t)$
+$b_t=(0.85 b_{t-1}+0.155(l_{t-1}+0.85 b_{t-1}+s_{t-m})(\epsilon _t)$
+$s_t=s_{t-m}+0.191l_{t-1}+0.85 b_{t-1}+s_{t-m})(\epsilon _t)$
+
+```{r}
+ets.model <- ets(solar_production_train, lambda = 'auto')
+summary(ets.model)
+checkresiduals(ets.model)
+
+```
+
+The ETS model that produces by far the lowest information criterion is the "AAA" model after Box-Cox transformation; unfortunately, we're still seeing significant autocorrelation in the residuals.
+
+# Performing CV and calculating MAE, MSE, and AICc for ETS AAA:
+
+```{r}
+k <- 180 # Minimum data length for fitting a model
+n <- length(solar_production_train) # Number of data points
+p <- 12 # Period
+H <- 12 # Forecast Horizon
+
+st <- tsp(solar_production_train)[1]+(k-2)/p # start time in units
+print(st)
+model_error <- matrix(NA,n-k,H)
+AICc_model <- list()
+
+### One Month rolling forecasting ###
+  
+# Sliding Window - With window of length = 180
+
+for(i in 1:(n-k))
+{
+
+  train_sli <- window(solar_production_train, start=st+(i-k+1)/p, end=st+i/p) ## Window Length: k
+  val <- window(solar_production_train, start=st + (i+1)/p, end=st + (i+H)/p) ## Window Length: H
+  if (i<4) {
+  cat(c("*** CV", i,":","len(Sliding Window):",length(train_sli), "len(Val):",length(val),'\n'  ))
+  cat(c("*** TRAIN - Sliding WIndow:",tsp(train_sli)[1],'-',tsp(train_sli)[2],'\n'))
+  cat(c("*** TEST:",tsp(val)[1],'-',tsp(val)[2],'\n'))
+  cat("*************************** \n \n")
+  }
+  
+  fit_model <- ets(train_sli, lambda = 'auto')
+  
+  fcast_model <- forecast(fit_model, h=H)
+  
+  model_error[i,1:length(val)] <- fcast_model[['mean']]-val
+  
+  AICc_model <- append(AICc_model, fit_model$aicc)
+}
+```
+```{r}
+MAE <- function(x){
+  return(mean(abs(x),na.rm=TRUE))
+}
+
+MSE <- function(x){
+  return(mean(x^2, na.rm=TRUE))
+}
+
+flattenlist <- function(x){  
+  morelists <- sapply(x, function(xprime) class(xprime)[1]=="list")
+  out <- c(x[!morelists], unlist(x[morelists], recursive=FALSE))
+  if(sum(morelists)){ 
+    Recall(out)
+  }else{
+    return(out)
+  }
+}
+
+MAE_model <- apply(model_error, 1, MAE)
+MSE_model <- apply(model_error, 1, MSE)
+
+ets.MAE <- mean(MAE_model)
+ets.MSE <- mean(MSE_model)
+results <- cbind(results,rbind(ets.MAE, ets.MSE))
+colnames(results) <- c("Baseline","ARIMA(4,1,4)(0,1,1)12", "ARIMA(0,1,2)(0,1,1)12", "ets")
+
+cat("Mean AICc:", mean(unlist(flattenlist(AICc_model))))
+```
+```{r}
+results
+
+```
+
+# Forecasting Error for ETS:
+
+```{r}
+ets.forecasting.MSE <- mean((forecast(ets.model, h = 12)$mean - solar_production_test)^2)
+ets.forecasting.MSE
+ets.forecasting.MAE <- mean(abs(forecast(ets.model, h = 12)$mean - solar_production_test))
+ets.forecasting.MAE
+plot(forecast(ets.model, h = 12))
+
+```
+
+# TBATS:
+
+```{r}
+tbats.model <- tbats(solar_production_train, use.damped.trend = FALSE)
+tbats.model
+checkresiduals(tbats.model)
+```
+
+# Performing CV and calculating MAE, MSE, and AICc for TBATS:
+
+```{r}
+ 
+k <- 220 # Minimum data length for fitting a model
+n <- length(solar_production_train) # Number of data points
+p <- 12 # Period
+H <- 12 # Forecast Horizon
+
+st <- tsp(solar_production_train)[1]+(k-2)/p # start time in units
+print(st)
+model_error <- matrix(NA,n-k,H)
+AICc_model <- list()
+
+### One Month rolling forecasting ###
+  
+# Sliding Window - With window of length = 180
+
+for(i in 1:(n-k))
+{
+
+  train_sli <- window(solar_production_train, start=st+(i-k+1)/p, end=st+i/p) ## Window Length: k
+  val <- window(solar_production_train, start=st + (i+1)/p, end=st + (i+H)/p) ## Window Length: H
+  if (i<4) {
+  cat(c("*** CV", i,":","len(Sliding Window):",length(train_sli), "len(Val):",length(val),'\n'  ))
+  cat(c("*** TRAIN - Sliding WIndow:",tsp(train_sli)[1],'-',tsp(train_sli)[2],'\n'))
+  cat(c("*** TEST:",tsp(val)[1],'-',tsp(val)[2],'\n'))
+  cat("*************************** \n \n")
+  }
+  
+  fit_model <- tbats(train_sli, use.damped.trend = FALSE)
+  
+  fcast_model <- forecast(fit_model, h=H)
+  
+  model_error[i,1:length(val)] <- fcast_model[['mean']]-val
+  
+  AICc_model <- append(AICc_model, fit_model$aicc)
+}
+```
+```{r}
+MAE <- function(x){
+  return(mean(abs(x),na.rm=TRUE))
+}
+
+MSE <- function(x){
+  return(mean(x^2, na.rm=TRUE))
+}
+
+flattenlist <- function(x){  
+  morelists <- sapply(x, function(xprime) class(xprime)[1]=="list")
+  out <- c(x[!morelists], unlist(x[morelists], recursive=FALSE))
+  if(sum(morelists)){ 
+    Recall(out)
+  }else{
+    return(out)
+  }
+}
+
+MAE_model <- apply(model_error, 1, MAE)
+MSE_model <- apply(model_error, 1, MSE)
+
+tbats.MAE <- mean(MAE_model)
+tbats.MSE <- mean(MSE_model)
+results <- cbind(results,rbind(tbats.MAE, tbats.MSE))
+colnames(results) <- c("Baseline","ARIMA(4,1,4)(0,1,1)12", "ARIMA(0,1,2)(0,1,1)12", "ets", "tbats")
+
+cat("Mean AICc:", mean(unlist(flattenlist(AICc_model))))
+```
+```{r}
+results
+
+
+```
+results
+# Forecasting Error for TBATS:
+
+```{r}
+tbats.forecasting.MSE <- mean((forecast(tbats.model, h = 12)$mean - solar_production_test)^2)
+tbats.forecasting.MSE
+tbats.forecasting.MAE <- mean(abs(forecast(tbats.model, h = 12)$mean - solar_production_test))
+tbats.forecasting.MAE
+plot(forecast(tbats.model, h = 12))
+```
+
+# Regression with ARIMA errors:
+solar[1:348]
+```{r}
+
+train <- ts(solar[1:348,],start=c(1989,1), frequency=12)
+test <- ts(solar[349:360,], end=c(2018,12), frequency=12)
+head(train)
+```
+
+```{r}
+
+lin_model <- glm(train[,2]~train[,3]+train[,9]+train[,10],data=train)
+summary(lin_model)
+tsdisplay(ts(lin_model$residuals))
+```
+
+```{r}
+regressionArima = auto.arima(ts(lin_model$residuals, frequency = 12),lambda = "auto") 
+FullArima <- Arima(train[,2],order = c(2,1,2), seasonal = c(1,1,1), lambda = "auto", xreg = exojeans)
+summary(FullArima)
+```
+
+```{r}
+RegX_forecast_smart <- forecast(FullArima,xreg = exojeans_smart, h = 12)
+summary(RegX_forecast_smart)
+```
+
+```{r}
+RegX_forecast_naive <- forecast(FullArima,xreg = exojeans_naive, h = 12)
+summary(RegX_forecast_naive)
+```
+
+```{r}
+(Smart_ARIMAX_MSE <- mean((RegX_forecast_smart$mean - test[,2])^2))
+(Smart_ARIMAX_MAE <- mean(abs(RegX_forecast_smart$mean - test[,2])))
+(Naive_ARIMAX_MSE <- mean((RegX_forecast_naive$mean - test[,2])^2))
+(Naive_ARIMAX_MAE <- mean(abs(RegX_forecast_naive$mean - test[,2])))
+```
+
+```{r}
+plot(RegX_forecast_naive, type = "l", col = 1, ylab = "Solar Production", xlab = "Year", main = "Regression with ARIMA Errors (Naive)")
+plot(RegX_forecast_smart, type = "l", col = 1, ylab = "Solar Production", xlab = "Year", main = "Regression with ARIMA Errors (Smart)")
+legend("topleft",legend=c("Naive Reg","'Smart' Reg", "True Value"),col=1:3,lty=1)
+```
+
